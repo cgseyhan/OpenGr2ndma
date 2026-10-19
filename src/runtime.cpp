@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <vector>
 #include <string>
 #include <strings.h>
 #include <unordered_map>
@@ -679,16 +681,288 @@ bool SampleCurve(const granny_curve2& curve, float t, int dim, float* out)
     return true;
 }
 
-void SampleTrack(const granny_transform_track& tr, float t, const granny_transform& rest, granny_transform& out)
+
+int MemberOffset(const TDef* d, const char* name, const TDef** out);
+
+// Granny 2.7+ compressed curve formats, decoded the way granny_curve.cpp
+// (Granny SDK 2.9) extracts knots and controls. Each curve is expanded once
+// into float knots/controls and cached.
+const float kQuatScaleOffset[16][2] = {
+    {0.707106781f * 2.0f, -0.707106781f}, {0.707106781f * 1.0f, -0.707106781f * 0.5f},
+    {0.707106781f * 0.5f, -0.707106781f * 0.75f}, {0.707106781f * 0.5f, -0.707106781f * 0.25f},
+    {0.707106781f * 0.5f, 0.707106781f * 0.25f}, {0.707106781f * 0.25f, -0.707106781f * 0.25f},
+    {0.707106781f * 0.25f, -0.707106781f * 0.125f}, {0.707106781f * 0.25f, 0.0f},
+    {-0.707106781f * 2.0f, 0.707106781f}, {-0.707106781f * 1.0f, 0.707106781f * 0.5f},
+    {-0.707106781f * 0.5f, 0.707106781f * 0.75f}, {-0.707106781f * 0.5f, 0.707106781f * 0.25f},
+    {-0.707106781f * 0.5f, -0.707106781f * 0.25f}, {-0.707106781f * 0.25f, 0.707106781f * 0.25f},
+    {-0.707106781f * 0.25f, 0.707106781f * 0.125f}, {-0.707106781f * 0.25f, 0.0f}};
+
+enum CurveKind { kCurveNone, kCurveIdentity, kCurveConstant, kCurveKeyframes, kCurveKnots };
+
+struct DecodedCurve {
+    CurveKind kind = kCurveNone;
+    int dim = 0;
+    int degree = 1;
+    std::vector<float> knots, controls;
+};
+
+struct CurveFields {
+    const TDef* type;
+    const uint8_t* obj;
+    const uint8_t* At(const char* name, const TDef** m = 0) const {
+        const TDef* tmp;
+        int off = MemberOffset(type, name, m ? m : &tmp);
+        return off < 0 ? 0 : obj + off;
+    }
+    float F(const char* name, int i = 0) const {
+        const uint8_t* q = At(name);
+        float v = 0;
+        if (q) memcpy(&v, q + 4 * i, 4);
+        return v;
+    }
+    int I16(const char* name) const {
+        const uint8_t* q = At(name);
+        int16_t v = 0;
+        if (q) memcpy(&v, q, 2);
+        return v;
+    }
+    unsigned U16(const char* name) const {
+        const uint8_t* q = At(name);
+        uint16_t v = 0;
+        if (q) memcpy(&v, q, 2);
+        return v;
+    }
+    // ReferenceToArray members are stored as int32 count + native pointer.
+    template <class T> int Array(const char* name, const T** data) const {
+        const uint8_t* q = At(name);
+        *data = 0;
+        if (!q) return 0;
+        int32_t n;
+        memcpy(&n, q, 4);
+        memcpy((void*)data, q + 4, sizeof(void*));
+        return *data && n > 0 ? n : 0;
+    }
+};
+
+float TruncatedReal(unsigned top16)
+{
+    uint32_t bits = (uint32_t)top16 << 16;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+bool DecodeCurve(const granny_curve2& curve, DecodedCurve& d)
+{
+    const TDef* t = curve.CurveData.Type;
+    if (!t || !curve.CurveData.Object || !t->Name) return false;
+    const char* prefix = "CurveDataHeader_";
+    if (strncmp(t->Name, prefix, strlen(prefix)) != 0) return false;
+    std::string fmt = t->Name + strlen(prefix);
+    CurveFields c{t, (const uint8_t*)curve.CurveData.Object};
+    d.degree = c.obj[1];
+    if (fmt == "DaIdentity") { d.kind = kCurveIdentity; d.dim = c.I16("Dimension"); return true; }
+    if (fmt == "DaConstant32f" || fmt == "D3Constant32f" || fmt == "D4Constant32f") {
+        d.kind = kCurveConstant;
+        if (fmt == "DaConstant32f") {
+            const float* v;
+            int n = c.Array("Controls", &v);
+            d.controls.assign(v, v + n);
+        } else {
+            int n = fmt[1] == '3' ? 3 : 4;
+            for (int i = 0; i < n; ++i) d.controls.push_back(c.F("Controls", i));
+        }
+        d.dim = (int)d.controls.size();
+        return d.dim > 0;
+    }
+    if (fmt == "DaKeyframes32f") {
+        const float* v;
+        int n = c.Array("Controls", &v);
+        d.kind = kCurveKeyframes;
+        d.dim = c.I16("Dimension");
+        if (d.dim <= 0) return false;
+        d.controls.assign(v, v + n - n % d.dim);
+        return !d.controls.empty();
+    }
+    d.kind = kCurveKnots;
+    if (fmt == "DaK32fC32f") {
+        const float *k, *v;
+        int nk = c.Array("Knots", &k), nc = c.Array("Controls", &v);
+        if (nk <= 0 || nc < nk) return false;
+        d.dim = nc / nk;
+        d.knots.assign(k, k + nk);
+        d.controls.assign(v, v + nk * d.dim);
+        return true;
+    }
+    if (fmt == "D4nK16uC15u" || fmt == "D4nK8uC7u") {
+        const bool wide = fmt == "D4nK16uC15u";
+        const float oneOverKnotScale = c.F("OneOverKnotScale");
+        unsigned table = c.U16("ScaleOffsetTableEntries");
+        float scales[4], offsets[4];
+        for (int i = 0; i < 4; ++i) {
+            int e = table & 0xf;
+            table >>= 4;
+            scales[i] = kQuatScaleOffset[e][0] / (wide ? 32767.0f : 127.0f);
+            offsets[i] = kQuatScaleOffset[e][1];
+        }
+        const uint16_t* w = 0;
+        const uint8_t* b = 0;
+        int count = wide ? c.Array("KnotsControls", &w) : c.Array("KnotsControls", &b);
+        int knots = count >> 2;
+        if (knots <= 0 || oneOverKnotScale == 0) return false;
+        d.dim = 4;
+        auto at = [&](int i) -> unsigned { return wide ? w[i] : b[i]; };
+        const unsigned top = wide ? 0x8000u : 0x80u, mask = wide ? 0x7fffu : 0x7fu;
+        const int shift = wide ? 14 : 6, signShift = wide ? 15 : 7;
+        for (int k = 0; k < knots; ++k) {
+            d.knots.push_back(at(k) / oneOverKnotScale);
+            unsigned v0 = at(knots + 3 * k), v1 = at(knots + 3 * k + 1), v2 = at(knots + 3 * k + 2);
+            const unsigned data[3] = {v0, v1, v2};
+            bool negative = (v0 & top) != 0;
+            int missing = (int)(((v1 >> shift) & 2) | (v2 >> signShift));
+            float q[4];
+            int dst = missing;
+            float sum = 0;
+            for (int src = 0; src < 3; ++src) {
+                dst = (dst + 1) & 3;
+                q[dst] = offsets[dst] + scales[dst] * (float)(data[src] & mask);
+                sum += q[dst] * q[dst];
+            }
+            float m = sqrtf((std::max)(0.0f, 1.0f - sum));
+            q[missing] = negative ? -m : m;
+            d.controls.insert(d.controls.end(), q, q + 4);
+        }
+        return true;
+    }
+    // Quantized vector formats: knots first, then the controls.
+    const bool k8 = fmt.find("K8u") != std::string::npos;
+    const bool k32 = fmt.find("K32f") != std::string::npos;
+    float oneOverKnotScale = k32 ? 1.0f : TruncatedReal(c.U16("OneOverKnotScaleTrunc"));
+    const uint16_t* w = 0;
+    const uint8_t* b = 0;
+    const float* f = 0;
+    int count = k32 ? c.Array("KnotsControls", &f) : k8 ? c.Array("KnotsControls", &b) : c.Array("KnotsControls", &w);
+    auto at = [&](int i) -> float { return k32 ? f[i] : k8 ? (float)b[i] : (float)w[i]; };
+    if (count <= 0 || oneOverKnotScale == 0) return false;
+    int perKnot, outDim;
+    std::vector<float> scales, offsets;
+    if (fmt == "DaK16uC16u" || fmt == "DaK8uC8u") {
+        const float* so;
+        int n = c.Array("ControlScaleOffsets", &so);
+        outDim = perKnot = n / 2;
+        if (outDim <= 0) return false;
+        scales.assign(so, so + outDim);
+        offsets.assign(so + outDim, so + 2 * outDim);
+    } else if (fmt == "D3K16uC16u" || fmt == "D3K8uC8u") {
+        outDim = perKnot = 3;
+        for (int i = 0; i < 3; ++i) { scales.push_back(c.F("ControlScales", i)); offsets.push_back(c.F("ControlOffsets", i)); }
+    } else if (fmt == "D3I1K32fC32f" || fmt == "D3I1K16uC16u" || fmt == "D3I1K8uC8u") {
+        outDim = 3; perKnot = 1;
+        for (int i = 0; i < 3; ++i) { scales.push_back(c.F("ControlScales", i)); offsets.push_back(c.F("ControlOffsets", i)); }
+    } else if (fmt == "D9I1K16uC16u" || fmt == "D9I1K8uC8u") {
+        outDim = 9; perKnot = 1;
+        scales.push_back(c.F("ControlScale")); offsets.push_back(c.F("ControlOffset"));
+    } else if (fmt == "D9I3K16uC16u" || fmt == "D9I3K8uC8u") {
+        outDim = 9; perKnot = 3;
+        for (int i = 0; i < 3; ++i) { scales.push_back(c.F("ControlScales", i)); offsets.push_back(c.F("ControlOffsets", i)); }
+    } else
+        return false;
+    int knots = count / (perKnot + 1);
+    if (knots <= 0) return false;
+    d.dim = outDim;
+    for (int k = 0; k < knots; ++k) {
+        d.knots.push_back(at(k) / oneOverKnotScale);
+        const int base = knots + k * perKnot;
+        float v[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+        if (outDim == 9 && perKnot == 1) {
+            float u = offsets[0] + scales[0] * at(base);
+            v[0] = v[4] = v[8] = u;
+        } else if (outDim == 9) {
+            v[0] = offsets[0] + scales[0] * at(base);
+            v[4] = offsets[1] + scales[1] * at(base + 1);
+            v[8] = offsets[2] + scales[2] * at(base + 2);
+        } else if (perKnot == 1) {
+            for (int i = 0; i < 3; ++i) v[i] = offsets[i] + scales[i] * at(base);
+        } else {
+            for (int i = 0; i < outDim; ++i) v[i] = offsets[i] + scales[i] * at(base + i);
+        }
+        d.controls.insert(d.controls.end(), v, v + outDim);
+    }
+    return true;
+}
+
+std::mutex g_curveMtx;
+std::map<const void*, DecodedCurve> g_curveCache;
+
+const DecodedCurve* CachedCurve(const granny_curve2& curve)
+{
+    if (!curve.CurveData.Object) return 0;
+    std::lock_guard<std::mutex> lock(g_curveMtx);
+    auto it = g_curveCache.find(curve.CurveData.Object);
+    if (it == g_curveCache.end()) {
+        DecodedCurve d;
+        if (!DecodeCurve(curve, d)) d.kind = kCurveNone;
+        it = g_curveCache.emplace(curve.CurveData.Object, std::move(d)).first;
+    }
+    return it->second.kind == kCurveNone ? 0 : &it->second;
+}
+
+void Lerp(const float* a, const float* b, float u, int dim, float* out)
+{
+    if (dim == 4) {
+        float dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+        float sb = dot < 0 ? -1.f : 1.f;
+        for (int i = 0; i < 4; ++i) out[i] = a[i] * (1 - u) + b[i] * sb * u;
+    } else
+        for (int i = 0; i < dim; ++i) out[i] = a[i] * (1 - u) + b[i] * u;
+}
+
+// Evaluates a compressed curve at t; timeStep drives keyframed curves (one key per frame).
+bool SampleCompressedCurve(const granny_curve2& curve, float t, float timeStep, int dim, float* out)
+{
+    const DecodedCurve* d = CachedCurve(curve);
+    if (!d) return false;
+    if (d->kind == kCurveIdentity) {
+        for (int i = 0; i < dim; ++i) out[i] = 0;
+        if (dim == 4) out[3] = 1;
+        if (dim == 9) out[0] = out[4] = out[8] = 1;
+        return true;
+    }
+    if (d->dim != dim) return false;
+    if (d->kind == kCurveConstant) { memcpy(out, d->controls.data(), dim * 4); return true; }
+    const int n = (int)d->controls.size() / dim;
+    if (n <= 0) return false;
+    if (d->kind == kCurveKeyframes) {
+        int frame = timeStep > 0 ? (int)(t / timeStep) : 0;
+        frame = (std::max)(0, (std::min)(n - 1, frame));
+        memcpy(out, d->controls.data() + frame * dim, dim * 4);
+        return true;
+    }
+    const std::vector<float>& K = d->knots;
+    const float* C = d->controls.data();
+    if (n == 1 || t <= K[0]) { memcpy(out, C, dim * 4); return true; }
+    if (t >= K[n - 1]) { memcpy(out, C + (n - 1) * dim, dim * 4); return true; }
+    int lo = (int)(std::upper_bound(K.begin(), K.begin() + n, t) - K.begin()) - 1;
+    int hi = lo + 1;
+    float span = K[hi] - K[lo];
+    float u = span > 0 ? (t - K[lo]) / span : 0;
+    if (d->degree == 0) u = 0;
+    Lerp(C + lo * dim, C + hi * dim, u, dim, out);
+    return true;
+}
+
+void SampleTrack(const granny_transform_track& tr, float t, float timeStep, const granny_transform& rest, granny_transform& out)
 {
     out = rest;
     float q[4];
-    if (SampleCurve(tr.OrientationCurve, t, 4, q)) {
+    if (SampleCurve(tr.OrientationCurve, t, 4, q) || SampleCompressedCurve(tr.OrientationCurve, t, timeStep, 4, q)) {
         float l = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
         if (l > 1e-8f) for (int i = 0; i < 4; ++i) out.Orientation[i] = q[i] / l;
     }
-    SampleCurve(tr.PositionCurve, t, 3, out.Position);
-    SampleCurve(tr.ScaleShearCurve, t, 9, &out.ScaleShear[0][0]);
+    if (!SampleCurve(tr.PositionCurve, t, 3, out.Position))
+        SampleCompressedCurve(tr.PositionCurve, t, timeStep, 3, out.Position);
+    if (!SampleCurve(tr.ScaleShearCurve, t, 9, &out.ScaleShear[0][0]))
+        SampleCompressedCurve(tr.ScaleShearCurve, t, timeStep, 9, &out.ScaleShear[0][0]);
 }
 
 void SampleLocalPose(GrnInstance* inst, int boneCount, std::vector<granny_transform>& local)
@@ -713,7 +987,7 @@ void SampleLocalPose(GrnInstance* inst, int boneCount, std::vector<granny_transf
             int ti = c->boneTrack[b];
             if (ti < 0) continue;
             granny_transform s;
-            SampleTrack(c->tg->TransformTracks[ti], t, sk->Bones[b].LocalTransform, s);
+            SampleTrack(c->tg->TransformTracks[ti], t, c->anim->TimeStep, sk->Bones[b].LocalTransform, s);
             granny_transform& a = acc[b];
             if (wsum[b] > 0) {
                 float d = a.Orientation[0] * s.Orientation[0] + a.Orientation[1] * s.Orientation[1] +
