@@ -583,6 +583,7 @@ void Identity(granny_transform& t)
 
 // ---------------------------------------------------------------- runtime objects
 struct GrnInstance;
+struct DecodedCurve;
 
 struct GrnControl
 {
@@ -598,6 +599,9 @@ struct GrnControl
     bool hasComplete = false;
     float completeClock = 0;
     bool freeOnceUnused = false;
+    // Orientation / position / scale-shear decoded curves of each transform track, resolved on first sample
+    std::vector<const DecodedCurve*> decodedCurves;
+    bool decodedCurvesReady = false;
 };
 
 struct GrnInstance
@@ -918,9 +922,8 @@ void Lerp(const float* a, const float* b, float u, int dim, float* out)
 }
 
 // Evaluates a compressed curve at t; timeStep drives keyframed curves (one key per frame).
-bool SampleCompressedCurve(const granny_curve2& curve, float t, float timeStep, int dim, float* out)
+bool SampleDecodedCurve(const DecodedCurve* d, float t, float timeStep, int dim, float* out)
 {
-    const DecodedCurve* d = CachedCurve(curve);
     if (!d) return false;
     if (d->kind == kCurveIdentity) {
         for (int i = 0; i < dim; ++i) out[i] = 0;
@@ -951,30 +954,48 @@ bool SampleCompressedCurve(const granny_curve2& curve, float t, float timeStep, 
     return true;
 }
 
-void SampleTrack(const granny_transform_track& tr, float t, float timeStep, const granny_transform& rest, granny_transform& out)
+// dc: the track's orientation, position and scale-shear decoded curves (CachedCurve results)
+void SampleTrack(const granny_transform_track& tr, const DecodedCurve* const* dc, float t, float timeStep,
+                 const granny_transform& rest, granny_transform& out)
 {
     out = rest;
     float q[4];
-    if (SampleCurve(tr.OrientationCurve, t, 4, q) || SampleCompressedCurve(tr.OrientationCurve, t, timeStep, 4, q)) {
+    if (SampleCurve(tr.OrientationCurve, t, 4, q) || SampleDecodedCurve(dc[0], t, timeStep, 4, q)) {
         float l = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
         if (l > 1e-8f) for (int i = 0; i < 4; ++i) out.Orientation[i] = q[i] / l;
     }
     if (!SampleCurve(tr.PositionCurve, t, 3, out.Position))
-        SampleCompressedCurve(tr.PositionCurve, t, timeStep, 3, out.Position);
+        SampleDecodedCurve(dc[1], t, timeStep, 3, out.Position);
     if (!SampleCurve(tr.ScaleShearCurve, t, 9, &out.ScaleShear[0][0]))
-        SampleCompressedCurve(tr.ScaleShearCurve, t, timeStep, 9, &out.ScaleShear[0][0]);
+        SampleDecodedCurve(dc[2], t, timeStep, 9, &out.ScaleShear[0][0]);
+}
+
+void ResolveDecodedCurves(GrnControl* c)
+{
+    const int n = c->tg->TransformTrackCount;
+    c->decodedCurves.resize((size_t)3 * (n > 0 ? n : 0));
+    for (int i = 0; i < n; ++i) {
+        const granny_transform_track& tr = c->tg->TransformTracks[i];
+        c->decodedCurves[3 * i + 0] = CachedCurve(tr.OrientationCurve);
+        c->decodedCurves[3 * i + 1] = CachedCurve(tr.PositionCurve);
+        c->decodedCurves[3 * i + 2] = CachedCurve(tr.ScaleShearCurve);
+    }
+    c->decodedCurvesReady = true;
 }
 
 void SampleLocalPose(GrnInstance* inst, int boneCount, std::vector<granny_transform>& local)
 {
     granny_skeleton* sk = inst->skel;
     local.resize(boneCount);
-    std::vector<float> wsum(boneCount, 0.f);
-    std::vector<granny_transform> acc(boneCount);
-    for (int b = 0; b < boneCount; ++b) memset(&acc[b], 0, sizeof(granny_transform));
+    static thread_local std::vector<float> wsum;
+    static thread_local std::vector<granny_transform> acc;
+    wsum.assign(boneCount, 0.f);
+    acc.resize(boneCount);
+    memset(acc.data(), 0, sizeof(granny_transform) * boneCount);
     for (GrnControl* c : inst->controls) {
         float w = Weight(c);
         if (w <= 0 || !c->tg) continue;
+        if (!c->decodedCurvesReady) ResolveDecodedCurves(c);
         float dur = c->anim->Duration;
         float t = LocalClock(c);
         if (dur > 0) {
@@ -987,7 +1008,7 @@ void SampleLocalPose(GrnInstance* inst, int boneCount, std::vector<granny_transf
             int ti = c->boneTrack[b];
             if (ti < 0) continue;
             granny_transform s;
-            SampleTrack(c->tg->TransformTracks[ti], t, c->anim->TimeStep, sk->Bones[b].LocalTransform, s);
+            SampleTrack(c->tg->TransformTracks[ti], &c->decodedCurves[3 * ti], t, c->anim->TimeStep, sk->Bones[b].LocalTransform, s);
             granny_transform& a = acc[b];
             if (wsum[b] > 0) {
                 float d = a.Orientation[0] * s.Orientation[0] + a.Orientation[1] * s.Orientation[1] +
