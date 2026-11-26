@@ -292,6 +292,8 @@ struct GrnFile
 {
     std::vector<uint8_t*> sectors;
     std::vector<void*> allocs;
+    // every block's address and size: GrannyFreeFile drops the decoded curves cached for objects inside them
+    std::vector<std::pair<const uint8_t*, size_t>> blocks;
     std::unordered_map<const uint8_t*, uint8_t*> fixups;
     std::unordered_map<const uint8_t*, TDef*> typeMemo;
     std::map<std::pair<const void*, const void*>, void*> objMemo;
@@ -308,6 +310,7 @@ struct GrnFile
     {
         void* p = calloc(1, n ? n : 1);
         allocs.push_back(p);
+        blocks.emplace_back((const uint8_t*)p, n ? n : 1);
         return p;
     }
 
@@ -507,6 +510,7 @@ GrnFile* LoadFile(const uint8_t* data, size_t len)
         fixCnt[s] = U32(h + 32);
         uint8_t* buf = (uint8_t*)calloc(1, dlen + 16);
         f->sectors.push_back(buf);
+        f->blocks.emplace_back(buf, (size_t)dlen + 16);
         if (dlen == 0) continue;
         if (ctype == 0) {
             if (dataOff + dlen > len) { delete f; return 0; }
@@ -1095,7 +1099,21 @@ GRANNY_DYNLINK(granny_file_info*) GrannyGetFileInfo(granny_file* File)
     return File ? ((GrnFile*)File)->info : 0;
 }
 
-GRANNY_DYNLINK(void) GrannyFreeFile(granny_file* File) { delete (GrnFile*)File; }
+// The decoded curve cache is keyed by the curve object's address: a file loaded later may get the same memory and
+// would otherwise read the freed file's curves (wrong poses), and the cache would grow for as long as the game runs.
+GRANNY_DYNLINK(void) GrannyFreeFile(granny_file* File)
+{
+    GrnFile* f = (GrnFile*)File;
+    if (!f) return;
+    {
+        std::lock_guard<std::mutex> lock(g_curveMtx);
+        for (const auto& b : f->blocks) {
+            if (g_curveCache.empty()) break;
+            g_curveCache.erase(g_curveCache.lower_bound(b.first), g_curveCache.lower_bound(b.first + b.second));
+        }
+    }
+    delete f;
+}
 GRANNY_DYNLINK(void) GrannyFreeFileSection(granny_file*, granny_int32x) {}
 
 GRANNY_DYNLINK(granny_int32x) GrannyGetTotalTypeSize(granny_data_type_definition const* TypeDefinition)
