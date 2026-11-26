@@ -624,6 +624,8 @@ struct GrnDeformer
 {
     int inStride = 0, outStride = 0;
     int inPos = -1, inNrm = -1, inW = -1, inI = -1;
+    // position and normal may be stored smaller than 3 floats (normals as BinormalInt16, ...): read like any member
+    granny_member_type posType = GrannyReal32Member, nrmType = GrannyReal32Member;
     granny_member_type wType = GrannyNormalUInt8Member, iType = GrannyUInt8Member;
     int wCount = 0, iCount = 0;
     int outPos = -1, outNrm = -1;
@@ -1261,7 +1263,9 @@ GRANNY_DYNLINK(granny_mesh_deformer*) GrannyNewMeshDeformer(granny_data_type_def
     d->outStride = TypeSize(OutputVertexLayout, NP);
     const TDef* m;
     d->inPos = MemberOffset(InputVertexLayout, GrannyVertexPositionName, &m);
+    if (m) d->posType = m->Type;
     d->inNrm = MemberOffset(InputVertexLayout, GrannyVertexNormalName, &m);
+    if (m) d->nrmType = m->Type;
     d->inW = MemberOffset(InputVertexLayout, GrannyVertexBoneWeightsName, &m);
     if (m) { d->wType = m->Type; d->wCount = Width(m); }
     d->inI = MemberOffset(InputVertexLayout, GrannyVertexBoneIndicesName, &m);
@@ -1293,8 +1297,12 @@ GRANNY_DYNLINK(void) GrannyDeformVertices(granny_mesh_deformer const* Deformer, 
         const uint8_t* s = (const uint8_t*)SourceVertices + (size_t)d->inStride * v;
         uint8_t* o = (uint8_t*)DestVertices + (size_t)d->outStride * v;
         float p[3], n[3] = {0, 0, 0}, rp[3] = {0, 0, 0}, rn[3] = {0, 0, 0};
-        memcpy(p, s + d->inPos, 12);
-        if (d->inNrm >= 0) memcpy(n, s + d->inNrm, 12);
+        if (d->posType == GrannyReal32Member) memcpy(p, s + d->inPos, 12);
+        else for (int j = 0; j < 3; ++j) p[j] = (float)ReadNum(d->posType, s + d->inPos, j);
+        if (d->inNrm >= 0) {
+            if (d->nrmType == GrannyReal32Member) memcpy(n, s + d->inNrm, 12);
+            else for (int j = 0; j < 3; ++j) n[j] = (float)ReadNum(d->nrmType, s + d->inNrm, j);
+        }
         int cnt = d->iCount;
         float total = 0;
         for (int k = 0; k < cnt; ++k) {
